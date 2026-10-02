@@ -28,6 +28,7 @@ val threadPolicyIgnoredViolationRules = listOf(
     IgnoreMiuiTurboSchedMonitorDiskRead,
     IgnoreChromiumKeyStoreDiskWrite,
     IgnoreAppCompatPersistLocalesDiskReadWrite,
+    IgnoreUnifiedPushConnectorDiskAccess,
 )
 
 /**
@@ -327,5 +328,15 @@ private data object IgnoreChromiumKeyStoreDiskWrite : IgnoreViolationRule {
             violation.stackTrace.any {
                 it.fileName?.startsWith("chromium-") == true
             }
+    }
+}
+
+/**
+ * Ignore the disk access the UnifiedPush connector performs while registering or looking up
+ * distributors. It reads and writes its own storage synchronously, which is beyond our control.
+ */
+private data object IgnoreUnifiedPushConnectorDiskAccess : IgnoreViolationRule {
+    override fun shouldIgnore(violation: Violation): Boolean {
+        return violation.stackTrace.any { it.className.startsWith("org.unifiedpush.android.connector") }
     }
 }

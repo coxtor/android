@@ -98,6 +98,15 @@ class AndroidApplicationDependenciesConventionPlugin : Plugin<Project> {
 
                     "implementation"(libs.car.core)
 
+                    // `:automotive` reuses `:app/src/main` sources, so both application modules
+                    // need the connector even though the feature is only offered on `:app`.
+                    "implementation"(libs.unifiedpush.connector) {
+                        // The connector depends on Tink, which brings the full protobuf runtime
+                        // while the app already uses protobuf-javalite. Keeping both duplicates
+                        // every com.google.protobuf class and fails the build.
+                        exclude(group = "com.google.protobuf", module = "protobuf-java")
+                    }
+
                     "androidTestImplementation"(libs.bundles.androidx.test)
                     "androidTestImplementation"(libs.leakcanary.android.instrumentation)
                     "androidTestImplementation"(libs.hilt.android.testing)

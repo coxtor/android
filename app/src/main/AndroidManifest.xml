@@ -1062,6 +1062,16 @@
                 android:value="true" />
         </service>
 
+        <!-- The UnifiedPush connector binds this service to deliver its events. It is only
+             reachable from the connector inside this app, so it stays unexported. -->
+        <service
+            android:name=".notifications.push.UnifiedPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name=".notifications.NotificationActionReceiver"
             android:enabled="true"

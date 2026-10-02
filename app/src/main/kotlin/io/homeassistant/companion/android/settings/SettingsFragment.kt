@@ -39,6 +39,8 @@ import io.homeassistant.companion.android.frontend.navigation.FrontendTarget
 import io.homeassistant.companion.android.launch.intentLaunchOnboarding
 import io.homeassistant.companion.android.launch.intentLaunchWithNavigateTo
 import io.homeassistant.companion.android.nfc.NfcSetupActivity
+import io.homeassistant.companion.android.notifications.push.UnifiedPushManager
+import io.homeassistant.companion.android.notifications.push.UnifiedPushState
 import io.homeassistant.companion.android.settings.assist.AssistSettingsFragment
 import io.homeassistant.companion.android.settings.assist.DefaultAssistantManager
 import io.homeassistant.companion.android.settings.controls.ManageControlsSettingsFragment
@@ -48,6 +50,7 @@ import io.homeassistant.companion.android.settings.language.LanguagesProvider
 import io.homeassistant.companion.android.settings.license.LicensesFragment
 import io.homeassistant.companion.android.settings.notification.NotificationChannelFragment
 import io.homeassistant.companion.android.settings.notification.NotificationHistoryFragment
+import io.homeassistant.companion.android.settings.push.CloudPushSettingFragment
 import io.homeassistant.companion.android.settings.qs.ManageTilesFragment
 import io.homeassistant.companion.android.settings.sensor.SensorSettingsFragment
 import io.homeassistant.companion.android.settings.sensor.SensorUpdateFrequencyFragment
@@ -74,6 +77,8 @@ class SettingsFragment(
     private val presenter: SettingsPresenter,
     private val langProvider: LanguagesProvider,
     private val defaultAssistantManager: DefaultAssistantManager,
+    private val unifiedPushManager: UnifiedPushManager,
+    private val isAutomotive: Boolean,
 ) : PreferenceFragmentCompat(),
     SettingsView {
 
@@ -262,6 +267,7 @@ class SettingsFragment(
         }
 
         updateNotificationChannelPrefs()
+        updateCloudPushPref()
 
         if (SdkVersion.isAtLeast(Build.VERSION_CODES.O)) {
             findPreference<Preference>("notification_permission")?.let {
@@ -296,6 +302,13 @@ class SettingsFragment(
         if (BuildConfig.FLAVOR == "full") {
             findPreference<Preference>("notification_rate_limit")?.let {
                 lifecycleScope.launch(Dispatchers.Main) {
+                    // The rate limits belong to the Firebase push proxy, so they say nothing while
+                    // another transport delivers the notifications.
+                    unifiedPushManager.refresh()
+                    if (unifiedPushManager.state.value != UnifiedPushState.Disabled) {
+                        it.isVisible = false
+                        return@launch
+                    }
                     // Runs in IO Dispatcher
                     val rateLimits = presenter.getNotificationRateLimits()
 
@@ -521,6 +534,23 @@ class SettingsFragment(
                 return@setOnPreferenceClickListener true
             }
             category?.addPreference(serverPreference)
+        }
+    }
+
+    /**
+     * Cloud push is not offered on Automotive: a distributor cannot be installed there, so the
+     * screen would only ever show an empty state.
+     */
+    private fun updateCloudPushPref() {
+        findPreference<Preference>("notification_cloud_push")?.let { pref ->
+            pref.isVisible = !isAutomotive
+            pref.setOnPreferenceClickListener {
+                parentFragmentManager.commit {
+                    replace(R.id.content, CloudPushSettingFragment::class.java, null)
+                    addToBackStack(getString(commonR.string.cloud_push_title))
+                }
+                return@setOnPreferenceClickListener true
+            }
         }
     }
 

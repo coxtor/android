@@ -131,6 +131,12 @@
             app:enableCopying="true"
             android:icon="@drawable/ic_notifications"
             android:summary="@string/rate_limit_summary"/>
+        <Preference
+            android:key="notification_cloud_push"
+            android:title="@string/cloud_push_title"
+            app:isPreferenceVisible="false"
+            android:icon="@drawable/ic_notifications"
+            android:summary="@string/cloud_push_summary"/>
     </PreferenceCategory>
     <PreferenceCategory
         android:title="@string/assist"

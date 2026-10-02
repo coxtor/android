@@ -11,10 +11,13 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import io.homeassistant.companion.android.common.data.integration.PushWebsocketSupport
 import io.homeassistant.companion.android.common.util.AppVersion
+import io.homeassistant.companion.android.common.util.MessagingToken
 import io.homeassistant.companion.android.common.util.isAutomotive
 import io.homeassistant.companion.android.di.qualifiers.IsAutomotive
 import io.homeassistant.companion.android.di.qualifiers.LocationTrackingSupport
 import io.homeassistant.companion.android.frontend.permissions.FcmSupport
+import io.homeassistant.companion.android.notifications.push.OpaquePushTokenProvider
+import java.util.UUID
 import javax.inject.Singleton
 import kotlin.time.Clock
 import kotlin.time.ExperimentalTime
@@ -30,6 +33,12 @@ object ApplicationModule {
     @Singleton
     fun providesWorkManager(@ApplicationContext context: Context): WorkManager {
         return WorkManager.getInstance(context)
+    }
+
+    @Provides
+    @Singleton
+    fun providesOpaquePushTokenProvider(): OpaquePushTokenProvider = OpaquePushTokenProvider {
+        MessagingToken(UUID.randomUUID().toString())
     }
 
     @Provides
