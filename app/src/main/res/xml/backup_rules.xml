@@ -3,4 +3,8 @@
     <include domain="database" path="." />
     <include domain="sharedpref" path="." />
     <exclude domain="sharedpref" path="session_0.xml" />
+    <!-- Keys of a push subscription. Their master key stays in the keystore of the device, so a
+         restored copy could not be read anyway, and secret key material does not belong in a
+         backup. The app asks the distributor for a new endpoint instead. -->
+    <exclude domain="sharedpref" path="webpush_keys_0.xml" />
 </full-backup-content>

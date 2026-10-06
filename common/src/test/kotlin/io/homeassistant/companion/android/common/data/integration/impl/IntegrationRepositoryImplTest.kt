@@ -6,8 +6,11 @@ import io.homeassistant.companion.android.common.data.LocalStorage
 import io.homeassistant.companion.android.common.data.integration.CloudPushTransport
 import io.homeassistant.companion.android.common.data.integration.DeviceRegistration
 import io.homeassistant.companion.android.common.data.integration.Entity
+import io.homeassistant.companion.android.common.data.integration.FakeWebPushKeyStorage
 import io.homeassistant.companion.android.common.data.integration.IntegrationException
 import io.homeassistant.companion.android.common.data.integration.IntegrationRepository
+import io.homeassistant.companion.android.common.data.integration.WebPushKeyRecord
+import io.homeassistant.companion.android.common.data.integration.WebPushKeys
 import io.homeassistant.companion.android.common.data.integration.impl.IntegrationRepositoryImpl.Companion.PREF_ASK_NOTIFICATION_PERMISSION
 import io.homeassistant.companion.android.common.data.integration.impl.entities.CheckRateLimits
 import io.homeassistant.companion.android.common.data.integration.impl.entities.EntityResponse
@@ -51,6 +54,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.fail
@@ -66,6 +70,10 @@ import retrofit2.Response
 private const val STORAGE_KEY_APP_VERSION = "app_version"
 private const val STORAGE_KEY_PUSH_TOKEN = "push_token"
 private const val STORAGE_KEY_PUSH_URL = "push_url"
+private const val STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF = "push_webpush_keys_ref"
+
+private val webPushKeys = WebPushKeys(p256dh = "BNcRd-public-key", auth = "YXV0aC1zZWNyZXQ")
+private val otherWebPushKeys = WebPushKeys(p256dh = "BRnWd-public-key", auth = "cmVuZXdlZC1hdXRo")
 
 class IntegrationRepositoryImplTest {
 
@@ -77,6 +85,7 @@ class IntegrationRepositoryImplTest {
     private val connectionStateProvider = mockk<ServerConnectionStateProvider>()
     private val localStorage = mockk<LocalStorage>()
     private val cloudPushRegistrationMutex = Mutex()
+    private val webPushKeyStorage = FakeWebPushKeyStorage()
 
     private lateinit var repository: IntegrationRepository
 
@@ -101,6 +110,7 @@ class IntegrationRepositoryImplTest {
             "",
             "",
             cloudPushRegistrationMutex,
+            webPushKeyStorage,
         )
     }
 
@@ -213,6 +223,7 @@ class IntegrationRepositoryImplTest {
             "",
             "",
             cloudPushRegistrationMutex,
+            webPushKeyStorage,
         )
 
         coEvery { localStorage.putBoolean(any(), any()) } returns Unit
@@ -315,8 +326,19 @@ class IntegrationRepositoryImplTest {
             val body = "".toResponseBody()
             coEvery { integrationService.callWebhook(any(), any()) } returns Response.error(code, body)
 
+            // A registered endpoint with its keys, so that the reregistration has the complete
+            // cloud push state to reproduce rather than a bare device.
+            val endpointUrl = "https://push.example.com/up1234"
             coEvery { localStorage.getString(any()) } returns null
+            coEvery { localStorage.getString(STORAGE_KEY_PUSH_URL) } returns endpointUrl
+            coEvery { localStorage.getString(STORAGE_KEY_PUSH_TOKEN) } returns "endpoint-token"
+            coEvery { localStorage.getString(STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF) } returns "keys-reference"
+            webPushKeyStorage.put(WebPushKeyRecord.REGISTERED, "keys-reference", endpointUrl, webPushKeys)
             stubReregistration()
+            val reregistration = slot<RegisterDeviceRequest>()
+            coEvery {
+                integrationService.registerDevice(any(), any(), capture(reregistration))
+            } returns mockk(relaxed = true)
 
             val registration = DeviceRegistration(deviceName = "New device name")
             repository.updateRegistration(
@@ -325,6 +347,15 @@ class IntegrationRepositoryImplTest {
             )
 
             coVerify { integrationService.registerDevice(any(), any(), any()) }
+            // A reregistration that dropped any part of this would leave the server unable to
+            // deliver to the endpoint that is actually registered.
+            val appData = checkNotNull(reregistration.captured.appData) { "No app data was sent" }
+            assertEquals(endpointUrl, appData["push_url"])
+            assertEquals(MessagingToken("endpoint-token"), appData["push_token"])
+            assertEquals(
+                mapOf("p256dh" to webPushKeys.p256dh, "auth" to webPushKeys.auth),
+                appData["push_webpush_keys"],
+            )
         }
     }
 
@@ -349,6 +380,7 @@ class IntegrationRepositoryImplTest {
             coEvery { localStorage.getString(STORAGE_KEY_APP_VERSION) } returns null
             storedPushToken(null)
             storedPushUrl(null)
+            storedKeysReference(null)
         }
 
         /**
@@ -366,6 +398,23 @@ class IntegrationRepositoryImplTest {
 
         private fun storedPushUrl(url: String?) {
             coEvery { localStorage.getString(STORAGE_KEY_PUSH_URL) } returns url
+        }
+
+        private fun storedKeysReference(reference: String?) {
+            coEvery { localStorage.getString(STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF) } returns reference
+        }
+
+        /** A registered endpoint whose keys are reachable under [reference]. */
+        private suspend fun storedEndpointWithKeys(
+            url: String = endpointUrl,
+            token: String = "endpoint-token",
+            keys: WebPushKeys = webPushKeys,
+            reference: String = "keys-reference",
+        ) {
+            storedPushUrl(url)
+            storedPushToken(token)
+            storedKeysReference(reference)
+            webPushKeyStorage.put(WebPushKeyRecord.REGISTERED, reference, url, keys)
         }
 
         private fun sentAppData(): Map<String, Any?> {
@@ -411,7 +460,11 @@ class IntegrationRepositoryImplTest {
             assertEquals(MessagingToken("endpoint-token"), sentAppData()["push_token"])
             // The URL and the token that owns it are stored as one state.
             assertEquals(
-                mapOf(STORAGE_KEY_PUSH_TOKEN to "endpoint-token", STORAGE_KEY_PUSH_URL to endpointUrl),
+                mapOf(
+                    STORAGE_KEY_PUSH_TOKEN to "endpoint-token",
+                    STORAGE_KEY_PUSH_URL to endpointUrl,
+                    STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF to null,
+                ),
                 storedCloudPush(),
             )
         }
@@ -443,7 +496,11 @@ class IntegrationRepositoryImplTest {
             // The transport is declared, so the token belongs to Firebase again. Dropping the
             // endpoint and storing the new token is one update.
             assertEquals(
-                mapOf(STORAGE_KEY_PUSH_TOKEN to "fcm-token", STORAGE_KEY_PUSH_URL to null),
+                mapOf(
+                    STORAGE_KEY_PUSH_TOKEN to "fcm-token",
+                    STORAGE_KEY_PUSH_URL to null,
+                    STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF to null,
+                ),
                 storedCloudPush(),
             )
         }
@@ -476,7 +533,11 @@ class IntegrationRepositoryImplTest {
             assertFalse(sentAppData().containsKey("push_token"))
             // Both keys are dropped in one update, so no mixed state can be observed or kept.
             assertEquals(
-                mapOf(STORAGE_KEY_PUSH_TOKEN to null, STORAGE_KEY_PUSH_URL to null),
+                mapOf(
+                    STORAGE_KEY_PUSH_TOKEN to null,
+                    STORAGE_KEY_PUSH_URL to null,
+                    STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF to null,
+                ),
                 storedCloudPush(),
             )
         }
@@ -495,7 +556,11 @@ class IntegrationRepositoryImplTest {
             // Nothing was registered, so the endpoint URL must not be stored without its token
             // either. Storing it would leave a registration the server does not know about.
             assertEquals(
-                mapOf(STORAGE_KEY_PUSH_TOKEN to null, STORAGE_KEY_PUSH_URL to null),
+                mapOf(
+                    STORAGE_KEY_PUSH_TOKEN to null,
+                    STORAGE_KEY_PUSH_URL to null,
+                    STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF to null,
+                ),
                 storedCloudPush(),
             )
         }
@@ -577,6 +642,210 @@ class IntegrationRepositoryImplTest {
                 "Unexpected app data in $json",
             )
         }
+
+        @Test
+        fun `Given an endpoint with keys when registering it then they are sent and kept apart from the state`() = runTest {
+            repository.updateRegistration(
+                DeviceRegistration(
+                    pushToken = MessagingToken("endpoint-token"),
+                    cloudPush = CloudPushTransport.Endpoint(endpointUrl, webPushKeys),
+                ),
+            )
+
+            assertEquals(
+                mapOf("p256dh" to webPushKeys.p256dh, "auth" to webPushKeys.auth),
+                sentAppData()["push_webpush_keys"],
+            )
+            // Only the reference is an ordinary value, the keys themselves went to protected storage.
+            val reference = storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF]
+            assertNotNull(reference)
+            assertEquals(reference, webPushKeyStorage.referenceOf(WebPushKeyRecord.REGISTERED))
+            assertFalse(
+                storedCloudPush().values.any { it?.contains(webPushKeys.auth) == true },
+                "The auth secret is in ordinary storage",
+            )
+        }
+
+        @Test
+        fun `Given an endpoint with keys when serializing the request then they are a nested object`() = runTest {
+            repository.updateRegistration(
+                DeviceRegistration(
+                    pushToken = MessagingToken("endpoint-token"),
+                    cloudPush = CloudPushTransport.Endpoint(endpointUrl, webPushKeys),
+                ),
+            )
+
+            val json = kotlinJsonMapper.encodeToString(
+                (requestSlot.captured as RegisterDeviceIntegrationRequest).data,
+            )
+            assertTrue(
+                json.contains(
+                    """"push_webpush_keys":{"p256dh":"${webPushKeys.p256dh}","auth":"${webPushKeys.auth}"}""",
+                ),
+                "Unexpected app data in $json",
+            )
+        }
+
+        @Test
+        fun `Given a keyless endpoint when registering it then no keys are sent`() = runTest {
+            repository.updateRegistration(
+                DeviceRegistration(
+                    pushToken = MessagingToken("endpoint-token"),
+                    cloudPush = CloudPushTransport.Endpoint(endpointUrl),
+                ),
+            )
+
+            assertFalse(sentAppData().containsKey("push_webpush_keys"))
+            assertNull(storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF])
+            assertFalse(webPushKeyStorage.has(WebPushKeyRecord.REGISTERED))
+        }
+
+        @Test
+        fun `Given Firebase when registering it then no keys are sent`() = runTest {
+            repository.updateRegistration(DeviceRegistration(pushToken = MessagingToken("fcm-token")))
+
+            // The push proxy built into the app is not a subscription, so it has no keys at all.
+            assertFalse(sentAppData().containsKey("push_webpush_keys"))
+            assertNull(storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF])
+        }
+
+        @Test
+        fun `Given a registered endpoint with keys when updating registration without a transport then they are reproduced`() = runTest {
+            storedEndpointWithKeys()
+
+            // Any unrelated update resolves against what is stored, for example the app version.
+            repository.updateRegistration(DeviceRegistration(appVersion = AppVersion("1.0.0", 1)))
+
+            assertEquals(endpointUrl, sentAppData()["push_url"])
+            assertEquals(
+                mapOf("p256dh" to webPushKeys.p256dh, "auth" to webPushKeys.auth),
+                sentAppData()["push_webpush_keys"],
+            )
+        }
+
+        @Test
+        fun `Given a newer endpoint that never reached the server when registering again then the registered one is reproduced`() = runTest {
+            // Endpoint A is registered. B was accepted on the device and its sync failed, so the
+            // server still has A. Any later registration update must reproduce A with A's keys,
+            // because replacing them with B's would describe a subscription the server cannot use.
+            storedEndpointWithKeys(url = endpointUrl, token = "token-of-a", keys = webPushKeys)
+            webPushKeyStorage.put(
+                WebPushKeyRecord.DESIRED,
+                reference = "snapshot-of-b",
+                endpoint = "https://push.example.com/up-b",
+                keys = otherWebPushKeys,
+            )
+
+            repository.updateRegistration(DeviceRegistration(appVersion = AppVersion("1.0.0", 1)))
+
+            assertEquals(endpointUrl, sentAppData()["push_url"])
+            assertEquals(MessagingToken("token-of-a"), sentAppData()["push_token"])
+            assertEquals(
+                mapOf("p256dh" to webPushKeys.p256dh, "auth" to webPushKeys.auth),
+                sentAppData()["push_webpush_keys"],
+            )
+        }
+
+        @Test
+        fun `Given a registered endpoint with keys when getting the registration then it reports them`() = runTest {
+            storedEndpointWithKeys()
+
+            assertEquals(
+                CloudPushTransport.Endpoint(endpointUrl, webPushKeys),
+                repository.getRegistration().cloudPush,
+            )
+        }
+
+        @Test
+        fun `Given a reference that does not match the stored record then no keys are reproduced`() = runTest {
+            storedPushUrl(endpointUrl)
+            storedPushToken("endpoint-token")
+            storedKeysReference("keys-reference")
+            // What a process death between the two stores leaves behind.
+            webPushKeyStorage.putUnreferenced(WebPushKeyRecord.REGISTERED, endpointUrl, webPushKeys)
+
+            repository.updateRegistration(DeviceRegistration(appVersion = AppVersion("1.0.0", 1)))
+
+            assertEquals(endpointUrl, sentAppData()["push_url"])
+            assertFalse(sentAppData().containsKey("push_webpush_keys"))
+            assertEquals(CloudPushTransport.Endpoint(endpointUrl), repository.getRegistration().cloudPush)
+        }
+
+        @Test
+        fun `Given a record of another endpoint then no keys are reproduced`() = runTest {
+            storedPushUrl(endpointUrl)
+            storedPushToken("endpoint-token")
+            storedKeysReference("keys-reference")
+            // The reference matches but the keys belong to an endpoint that is no longer registered.
+            webPushKeyStorage.put(
+                WebPushKeyRecord.REGISTERED,
+                reference = "keys-reference",
+                endpoint = "https://push.example.com/up-other",
+                keys = webPushKeys,
+            )
+
+            repository.updateRegistration(DeviceRegistration(appVersion = AppVersion("1.0.0", 1)))
+
+            assertFalse(sentAppData().containsKey("push_webpush_keys"))
+        }
+
+        @Test
+        fun `Given a registered endpoint when only its keys are renewed then the new ones are stored under a new reference`() = runTest {
+            storedEndpointWithKeys(reference = "old-reference")
+
+            repository.updateRegistration(
+                DeviceRegistration(cloudPush = CloudPushTransport.Endpoint(endpointUrl, otherWebPushKeys)),
+            )
+
+            assertEquals(
+                mapOf("p256dh" to otherWebPushKeys.p256dh, "auth" to otherWebPushKeys.auth),
+                sentAppData()["push_webpush_keys"],
+            )
+            // A renewal under the same URL has to get a reference of its own, otherwise a reader
+            // could not tell the old keys from the new ones.
+            val reference = storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF]
+            assertNotEquals("old-reference", reference)
+            assertEquals(reference, webPushKeyStorage.referenceOf(WebPushKeyRecord.REGISTERED))
+        }
+
+        @Test
+        fun `Given unchanged keys when updating registration then the reference is reused`() = runTest {
+            storedEndpointWithKeys(reference = "keys-reference")
+
+            repository.updateRegistration(DeviceRegistration(appVersion = AppVersion("1.0.0", 1)))
+
+            // Rewriting protected storage for an unrelated update would be pointless churn.
+            assertEquals("keys-reference", storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF])
+            assertEquals("keys-reference", webPushKeyStorage.referenceOf(WebPushKeyRecord.REGISTERED))
+        }
+
+        @Test
+        fun `Given a registered endpoint with keys when handing the registration back to Firebase then they are forgotten`() = runTest {
+            storedEndpointWithKeys()
+
+            repository.updateRegistration(
+                DeviceRegistration(
+                    pushToken = MessagingToken("fcm-token"),
+                    cloudPush = CloudPushTransport.Firebase,
+                ),
+            )
+
+            assertFalse(sentAppData().containsKey("push_webpush_keys"))
+            assertNull(storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF])
+            assertFalse(webPushKeyStorage.has(WebPushKeyRecord.REGISTERED))
+        }
+
+        @Test
+        fun `Given a registered endpoint with keys when cloud push is unregistered then they are forgotten`() = runTest {
+            storedEndpointWithKeys()
+
+            repository.updateRegistration(DeviceRegistration(cloudPush = CloudPushTransport.Firebase))
+
+            assertFalse(sentAppData().containsKey("push_url"))
+            assertFalse(sentAppData().containsKey("push_webpush_keys"))
+            assertNull(storedCloudPush()[STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF])
+            assertFalse(webPushKeyStorage.has(WebPushKeyRecord.REGISTERED))
+        }
     }
 
     @Nested
@@ -605,6 +874,7 @@ class IntegrationRepositoryImplTest {
                 "",
                 "",
                 cloudPushRegistrationMutex,
+                webPushKeyStorage,
             )
 
             // A stateful storage so that the order of reads and writes is observable.
@@ -714,6 +984,7 @@ class IntegrationRepositoryImplTest {
             } returns CheckRateLimits(target = "target", rateLimits = rateLimits)
             coEvery { localStorage.getString(STORAGE_KEY_PUSH_URL) } returns null
             coEvery { localStorage.getString(STORAGE_KEY_PUSH_TOKEN) } returns null
+            coEvery { localStorage.getString(STORAGE_KEY_PUSH_WEBPUSH_KEYS_REF) } returns null
         }
 
         @Test

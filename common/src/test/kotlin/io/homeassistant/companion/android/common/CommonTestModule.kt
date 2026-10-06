@@ -4,7 +4,9 @@ import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
+import io.homeassistant.companion.android.common.data.integration.FakeWebPushKeyStorage
 import io.homeassistant.companion.android.common.data.integration.PushWebsocketSupport
+import io.homeassistant.companion.android.common.data.integration.WebPushKeyStorage
 import io.homeassistant.companion.android.common.sensors.SensorSettingsIntentProvider
 import io.homeassistant.companion.android.common.util.AppVersion
 import io.homeassistant.companion.android.common.util.MessagingToken
@@ -36,4 +38,12 @@ object CommonTestModule {
     @Provides
     @Singleton
     fun providesSensorSettingsIntentProvider(): SensorSettingsIntentProvider = SensorSettingsIntentProvider { _, _, _, _ -> null }
+
+    /**
+     * The protected storage of the subscription keys is implemented by the application modules, so
+     * `:common` has to bring its own for the test graph, just like the push support above.
+     */
+    @Provides
+    @Singleton
+    fun providesWebPushKeyStorage(): WebPushKeyStorage = FakeWebPushKeyStorage()
 }

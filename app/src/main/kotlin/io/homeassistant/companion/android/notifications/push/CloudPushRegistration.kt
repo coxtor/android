@@ -3,6 +3,25 @@ package io.homeassistant.companion.android.notifications.push
 /** Prefix of the connector instance, so the generation can be read back from a callback. */
 private const val INSTANCE_PREFIX = "unifiedpush-"
 
+/**
+ * One endpoint a distributor handed out, exactly as it was accepted.
+ *
+ * A callback carries a URL together with the key material that belongs to it, and a distributor may
+ * renew either of them without the other changing. The two are therefore kept and replaced as one
+ * snapshot, never merged: [snapshotId] identifies this one pair, so the keys of one callback can
+ * never end up paired with the URL of another.
+ *
+ * This is not the same thing as [CloudPushRegistration.generation]: the generation says which
+ * selection owns the registration, the snapshot says which accepted endpoint it currently is.
+ *
+ * @property url Endpoint Home Assistant posts the notification to.
+ * @property snapshotId Opaque id of this snapshot. `null` for an endpoint that was stored before
+ * the app kept key material, where whether keys exist is unknown rather than known to be no.
+ * @property keysPresent Whether the distributor supplied a usable key pair with this endpoint,
+ * which is then expected in protected storage under [snapshotId].
+ */
+data class EndpointSnapshot(val url: String, val snapshotId: String?, val keysPresent: Boolean)
+
 /** The cloud push transport the user asked for. */
 sealed interface DesiredCloudPushTransport {
 
@@ -12,9 +31,9 @@ sealed interface DesiredCloudPushTransport {
     /**
      * Notifications go through a UnifiedPush distributor.
      *
-     * @property endpointUrl Endpoint of this registration, `null` until a distributor handed one out.
+     * @property endpoint Endpoint of this registration, `null` until a distributor handed one out.
      */
-    data class UnifiedPush(val endpointUrl: String?) : DesiredCloudPushTransport
+    data class UnifiedPush(val endpoint: EndpointSnapshot?) : DesiredCloudPushTransport
 }
 
 /**

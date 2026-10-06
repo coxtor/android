@@ -15,6 +15,9 @@ import io.homeassistant.companion.android.common.data.integration.IntegrationExc
 import io.homeassistant.companion.android.common.data.integration.IntegrationRepository
 import io.homeassistant.companion.android.common.data.integration.SensorRegistration
 import io.homeassistant.companion.android.common.data.integration.UpdateLocation
+import io.homeassistant.companion.android.common.data.integration.WebPushKeyRecord
+import io.homeassistant.companion.android.common.data.integration.WebPushKeyStorage
+import io.homeassistant.companion.android.common.data.integration.WebPushKeys
 import io.homeassistant.companion.android.common.data.integration.applyCompressedStateDiff
 import io.homeassistant.companion.android.common.data.integration.impl.entities.ActionRequest
 import io.homeassistant.companion.android.common.data.integration.impl.entities.CallServiceIntegrationRequest
@@ -54,6 +57,7 @@ import io.homeassistant.companion.android.di.qualifiers.NamedIntegrationStorage
 import io.homeassistant.companion.android.di.qualifiers.NamedManufacturer
 import io.homeassistant.companion.android.di.qualifiers.NamedModel
 import io.homeassistant.companion.android.di.qualifiers.NamedOsVersion
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
@@ -73,6 +77,17 @@ import timber.log.Timber
 private const val PUSH_URL = BuildConfig.PUSH_URL
 private const val RATE_LIMIT_URL = BuildConfig.RATE_LIMIT_URL
 
+// The cloud push registration is stored per device and not per server, so these three keys are
+// shared by every IntegrationRepositoryImpl and guarded by one lock.
+private const val PREF_PUSH_TOKEN = "push_token"
+
+// Only set while a transport other than CloudPushTransport.Firebase owns the push registration.
+private const val PREF_PUSH_URL = "push_url"
+
+// Points at the keys of the registered endpoint in the WebPushKeyStorage and holds no key material
+// itself. Only set while those keys exist.
+private const val PREF_PUSH_WEBPUSH_KEYS_REF = "push_webpush_keys_ref"
+
 /**
  * Whether both describe the same transport, ignoring which URL an endpoint points at. Renewing the
  * URL of an already registered endpoint is the same transport, switching to Firebase is not.
@@ -80,16 +95,6 @@ private const val RATE_LIMIT_URL = BuildConfig.RATE_LIMIT_URL
 private fun CloudPushTransport.isSameTransportAs(other: CloudPushTransport): Boolean = when (this) {
     is CloudPushTransport.Endpoint -> other is CloudPushTransport.Endpoint
     CloudPushTransport.Firebase -> other is CloudPushTransport.Firebase
-}
-
-/**
- * A stored push endpoint identifies its own transport, because Firebase never stores one and uses
- * [PUSH_URL] instead.
- */
-private fun String?.toCloudPushTransport(): CloudPushTransport = if (isNullOrBlank()) {
-    CloudPushTransport.Firebase
-} else {
-    CloudPushTransport.Endpoint(this)
 }
 
 /**
@@ -136,6 +141,107 @@ private fun DeviceRegistration.resolveCloudPushAgainst(
     )
 }
 
+/**
+ * The keys of the endpoint registered at [url], reproduced for every registration that resolves
+ * against what is stored. `null` while they are not available, which is then what gets registered.
+ *
+ * They are only returned while [reference] and [url] still match what the record was stored for.
+ * Neither the endpoint nor the token identifies them on its own: a subscription can renew its keys
+ * while both of them stay exactly the same.
+ */
+private suspend fun WebPushKeyStorage.registeredKeys(reference: String?, url: String): WebPushKeys? {
+    if (reference == null) return null
+    return get(WebPushKeyRecord.REGISTERED, reference, url)
+}
+
+/**
+ * Stores the keys of [endpoint] and returns the reference to put next to the token and the URL, or
+ * `null` when this registration has no keys.
+ *
+ * The record is written before the reference that will point at it, so a process death between the
+ * two can only leave a record nothing references. [previousReference] is reused while it still
+ * resolves to exactly these keys for this endpoint, which keeps an unrelated registration update
+ * from rewriting protected storage, and a new one is minted as soon as anything about the keys or
+ * the endpoint differs.
+ */
+private suspend fun WebPushKeyStorage.publishRegisteredKeys(
+    endpoint: CloudPushTransport.Endpoint?,
+    previousReference: String?,
+): String? {
+    val keys = endpoint?.webPushKeys ?: return null
+    val unchanged = previousReference != null &&
+        get(WebPushKeyRecord.REGISTERED, previousReference, endpoint.url) == keys
+    return if (unchanged) {
+        previousReference
+    } else {
+        UUID.randomUUID().toString().also { put(WebPushKeyRecord.REGISTERED, it, endpoint.url, keys) }
+    }
+}
+
+/**
+ * Stores the cloud push part of [resolvedCloudPush], with the token, the endpoint URL and the
+ * reference to the keys in one transaction: they describe a single registration, so neither a reader
+ * nor a process death may see or keep one of them without the others.
+ *
+ * Cloud push is stored exactly while there is a token to send, which is what [toAppData] sends, so
+ * an endpoint never ends up stored without the token owning it. The token key is left out of the
+ * update while the stored token stays untouched, see [ResolvedCloudPush.replacesStoredToken].
+ *
+ * The keys themselves cannot share that transaction, because they live in protected storage. Only
+ * the reference does, and a read has to prove that reference before it uses the keys, so the two
+ * stores can disagree about whether the keys exist but never about which endpoint they belong to.
+ */
+private suspend fun persistCloudPush(
+    localStorage: LocalStorage,
+    webPushKeyStorage: WebPushKeyStorage,
+    resolvedCloudPush: ResolvedCloudPush,
+) {
+    val pushToken = resolvedCloudPush.pushToken?.value?.takeIf { it.isNotBlank() }
+    val endpoint = (resolvedCloudPush.transport as? CloudPushTransport.Endpoint)
+        ?.takeIf { pushToken != null }
+    val previousKeysReference = localStorage.getString(PREF_PUSH_WEBPUSH_KEYS_REF)
+    val keysReference = webPushKeyStorage.publishRegisteredKeys(endpoint, previousKeysReference)
+    localStorage.putStrings(
+        buildMap {
+            if (resolvedCloudPush.replacesStoredToken) {
+                put(PREF_PUSH_TOKEN, pushToken)
+            }
+            put(PREF_PUSH_URL, endpoint?.url)
+            put(PREF_PUSH_WEBPUSH_KEYS_REF, keysReference)
+        },
+    )
+    if (keysReference == null && previousKeysReference != null) {
+        // Nothing references the record any more, so the keys of the registration that was just
+        // replaced can go. This runs after the reference is gone rather than before, so a process
+        // death in between can only leave a record that no read would return.
+        webPushKeyStorage.clear(WebPushKeyRecord.REGISTERED)
+    }
+}
+
+/**
+ * The cloud push part of `app_data`, empty while there is no token to send.
+ *
+ * Home Assistant only accepts `push_url` and `push_token` together and rejects a blank URL, so both
+ * are omitted as long as there is nothing to register. [builtInPushUrl] is the push proxy built into
+ * the app, which is where the Firebase transport points.
+ */
+private fun ResolvedCloudPush.toAppData(builtInPushUrl: String): Map<String, Any> {
+    if (pushToken.isNullOrBlank()) return emptyMap()
+    val endpoint = transport as? CloudPushTransport.Endpoint
+    return buildMap {
+        put("push_url", endpoint?.url ?: builtInPushUrl)
+        put("push_token", pushToken)
+        // The recipient keys of the subscription, sent so that a sender can address it as RFC 8291
+        // describes. Home Assistant currently posts the notification unencrypted and ignores them,
+        // see https://github.com/home-assistant/core/blob/dev/homeassistant/components/mobile_app/notify.py.
+        // Only an endpoint ever has them: the push proxy built into the app is not a WebPush
+        // subscription, so the Firebase transport never sends them.
+        endpoint?.webPushKeys?.let { keys ->
+            put("push_webpush_keys", mapOf("p256dh" to keys.p256dh, "auth" to keys.auth))
+        }
+    }
+}
+
 class IntegrationRepositoryImpl @AssistedInject constructor(
     private val integrationService: IntegrationService,
     private val serverManager: ServerManager,
@@ -151,6 +257,11 @@ class IntegrationRepositoryImpl @AssistedInject constructor(
      * [io.homeassistant.companion.android.common.data.integration.IntegrationRepositoryFactory].
      */
     private val cloudPushRegistrationMutex: Mutex,
+    /**
+     * Protected storage of the keys of the registered endpoint. They are kept out of
+     * [localStorage], which only holds the reference that points at them.
+     */
+    private val webPushKeyStorage: WebPushKeyStorage,
 ) : IntegrationRepository {
 
     companion object {
@@ -160,13 +271,6 @@ class IntegrationRepositoryImpl @AssistedInject constructor(
 
         // Note: _not_ server-specific
         private const val PREF_APP_VERSION = "app_version"
-
-        // Note: _not_ server-specific
-        private const val PREF_PUSH_TOKEN = "push_token"
-
-        // Note: _not_ server-specific. Only set while a transport other than
-        // CloudPushTransport.Firebase owns the push registration.
-        private const val PREF_PUSH_URL = "push_url"
 
         // Note: _not_ server-specific
         private const val PREF_ORPHANED_THREAD_BORDER_AGENT_IDS = "orphaned_thread_border_agent_ids"
@@ -307,8 +411,16 @@ class IntegrationRepositoryImpl @AssistedInject constructor(
         )
     }
 
-    private suspend fun storedCloudPushTransport(): CloudPushTransport =
-        localStorage.getString(PREF_PUSH_URL).toCloudPushTransport()
+    /**
+     * The registered transport. A stored push endpoint identifies its own transport, because
+     * Firebase never stores one and uses [PUSH_URL] instead.
+     */
+    private suspend fun storedCloudPushTransport(): CloudPushTransport {
+        val url = localStorage.getString(PREF_PUSH_URL)
+        if (url.isNullOrBlank()) return CloudPushTransport.Firebase
+        val reference = localStorage.getString(PREF_PUSH_WEBPUSH_KEYS_REF)
+        return CloudPushTransport.Endpoint(url, webPushKeyStorage.registeredKeys(reference, url))
+    }
 
     private suspend fun resolveCloudPush(deviceRegistration: DeviceRegistration): ResolvedCloudPush =
         deviceRegistration.resolveCloudPushAgainst(
@@ -325,6 +437,11 @@ class IntegrationRepositoryImpl @AssistedInject constructor(
      * [createUpdateRegistrationRequest] sends. An endpoint URL therefore never ends up stored
      * without the token owning it. The token key is left out of the update while the stored token
      * stays untouched, see [ResolvedCloudPush.replacesStoredToken].
+     *
+     * The keys of the endpoint cannot share that transaction, because they live in protected
+     * storage. What is in the transaction is the reference that points at them, and a read has to
+     * prove that reference before it uses the keys, so the two stores can disagree about whether the
+     * keys exist but never about which endpoint they belong to.
      */
     private suspend fun persistDeviceRegistration(
         deviceRegistration: DeviceRegistration,
@@ -336,18 +453,7 @@ class IntegrationRepositoryImpl @AssistedInject constructor(
         if (deviceRegistration.deviceName != null) {
             serverManager.updateServer(server().copy(deviceName = deviceRegistration.deviceName))
         }
-        val pushToken = resolvedCloudPush.pushToken?.value?.takeIf { it.isNotBlank() }
-        val endpointUrl = (resolvedCloudPush.transport as? CloudPushTransport.Endpoint)
-            ?.url
-            ?.takeIf { pushToken != null }
-        localStorage.putStrings(
-            buildMap {
-                if (resolvedCloudPush.replacesStoredToken) {
-                    put(PREF_PUSH_TOKEN, pushToken)
-                }
-                put(PREF_PUSH_URL, endpointUrl)
-            },
-        )
+        persistCloudPush(localStorage, webPushKeyStorage, resolvedCloudPush)
     }
 
     override suspend fun deletePreferences() {
@@ -846,15 +952,10 @@ class IntegrationRepositoryImpl @AssistedInject constructor(
         resolvedCloudPush: ResolvedCloudPush,
     ): RegisterDeviceRequest {
         val oldDeviceRegistration = getRegistration()
-        val pushToken = resolvedCloudPush.pushToken
 
-        val appData = mutableMapOf<String, Any>("push_websocket_channel" to deviceRegistration.pushWebsocket)
-        // Home Assistant only accepts push_url and push_token together and rejects a blank URL, so
-        // both are omitted as long as there is no token to send.
-        if (!pushToken.isNullOrBlank()) {
-            appData["push_url"] =
-                (resolvedCloudPush.transport as? CloudPushTransport.Endpoint)?.url ?: PUSH_URL
-            appData["push_token"] = pushToken
+        val appData = buildMap<String, Any> {
+            put("push_websocket_channel", deviceRegistration.pushWebsocket)
+            putAll(resolvedCloudPush.toAppData(PUSH_URL))
         }
 
         return RegisterDeviceRequest(

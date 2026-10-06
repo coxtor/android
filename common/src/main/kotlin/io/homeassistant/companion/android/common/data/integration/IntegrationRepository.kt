@@ -108,6 +108,7 @@ internal class IntegrationRepositoryFactory @Inject constructor(
     @NamedModel private val model: String,
     @NamedOsVersion private val osVersion: String,
     @NamedDeviceId private val deviceId: String,
+    private val webPushKeyStorage: WebPushKeyStorage,
 ) {
     /**
      * Shared by every server because the cloud push registration it guards is stored per device,
@@ -126,6 +127,7 @@ internal class IntegrationRepositoryFactory @Inject constructor(
             osVersion = osVersion,
             deviceId = deviceId,
             cloudPushRegistrationMutex = cloudPushRegistrationMutex,
+            webPushKeyStorage = webPushKeyStorage,
         )
     }
 }

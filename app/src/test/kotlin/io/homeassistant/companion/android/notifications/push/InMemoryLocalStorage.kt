@@ -1,6 +1,7 @@
 package io.homeassistant.companion.android.notifications.push
 
 import io.homeassistant.companion.android.common.data.LocalStorage
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -22,6 +23,19 @@ internal class InMemoryLocalStorage : LocalStorage {
      */
     var delayNextReadMs: Long = 0
 
+    /** Everything that is stored, so a test can assert what did *not* end up in here. */
+    val storedValues: Map<String, Any> get() = values.toMap()
+
+    private val readGates = mutableMapOf<String, CompletableDeferred<Unit>>()
+
+    /**
+     * Makes the next read of [key] wait for the returned gate.
+     *
+     * A test uses this to hold a reader at a chosen point in a multi-value read and let a writer run
+     * in between, which is how it can tell a coherent read from one that saw half of each state.
+     */
+    fun gateNextReadOf(key: String): CompletableDeferred<Unit> = CompletableDeferred<Unit>().also { readGates[key] = it }
+
     override suspend fun putString(key: String, value: String?) = put(key, value)
 
     /** Applies every entry in one go, so no read can land between them. */
@@ -29,7 +43,11 @@ internal class InMemoryLocalStorage : LocalStorage {
         values.forEach { (key, value) -> put(key, value) }
     }
 
-    override suspend fun getString(key: String): String? = values[key] as? String
+    override suspend fun getString(key: String): String? {
+        consumeArmedDelay()
+        readGates.remove(key)?.await()
+        return values[key] as? String
+    }
 
     override suspend fun putLong(key: String, value: Long?) = put(key, value)
 
@@ -37,10 +55,7 @@ internal class InMemoryLocalStorage : LocalStorage {
 
     override suspend fun putInt(key: String, value: Int?) = put(key, value)
 
-    override suspend fun getInt(key: String): Int? {
-        consumeArmedDelay()
-        return values[key] as? Int
-    }
+    override suspend fun getInt(key: String): Int? = values[key] as? Int
 
     override suspend fun putBoolean(key: String, value: Boolean) = put(key, value)
 

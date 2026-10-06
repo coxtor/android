@@ -3,6 +3,7 @@ package io.homeassistant.companion.android.notifications.push
 import androidx.annotation.VisibleForTesting
 import androidx.work.WorkManager
 import io.homeassistant.companion.android.common.data.integration.CloudPushTransport
+import io.homeassistant.companion.android.common.data.integration.WebPushKeys
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.frontend.permissions.FcmSupport
 import io.homeassistant.companion.android.notifications.push.CloudPushSyncWorker.Companion.enqueueCloudPushSync
@@ -126,7 +127,8 @@ class UnifiedPushManager @VisibleForTesting constructor(
 
         val desired = registration.desired
         if (desired !is DesiredCloudPushTransport.UnifiedPush) return
-        if (desired.endpointUrl == null) {
+        val endpoint = desired.endpoint
+        if (endpoint == null) {
             // A generation can want UnifiedPush without ever having received an endpoint, for
             // example when the process died between asking the distributor and its answer. Nobody
             // else would ask again, so [UnifiedPushState.Registering] would describe a registration
@@ -134,9 +136,27 @@ class UnifiedPushManager @VisibleForTesting constructor(
             if (state == UnifiedPushState.Registering) {
                 workManager.enqueueUnifiedPushRegister(requiresNetwork = false)
             }
-        } else if (registeredTransport() !is CloudPushTransport.Endpoint) {
-            // An endpoint can be stored while the process died before it reached the server.
-            workManager.enqueueCloudPushSync(registration.generation)
+            return
+        }
+
+        val keys = registrationRepository.endpointKeys(endpoint)
+        when {
+            // Stored before the app kept key material, so whether this endpoint has keys is
+            // unknown. Only the distributor can answer that, and only with a new snapshot.
+            endpoint.snapshotId == null -> workManager.enqueueUnifiedPushRegister(requiresNetwork = false)
+            // The state promises keys that are not there. Registering the endpoint without them
+            // would claim a subscription that a sender cannot address, so a new one is asked for
+            // instead. A snapshot that never had keys does not end up here, so this cannot loop.
+            endpoint.keysPresent && keys == null -> {
+                Timber.w("The keys of the wanted endpoint are gone, registering with the distributor again")
+                workManager.enqueueUnifiedPushRegister(requiresNetwork = false)
+            }
+            // What the servers have is not what the user wants. The process can die after an
+            // endpoint was accepted but before its sync was even queued, so this is the only place
+            // that notices, and it has to compare the whole tuple to do so.
+            !registeredTransport().isUpToDateFor(endpoint, keys) -> {
+                workManager.enqueueCloudPushSync(registration.generation, endpoint.snapshotId)
+            }
         }
     }
 
@@ -170,7 +190,7 @@ class UnifiedPushManager @VisibleForTesting constructor(
             connector.removeDistributor()
         }
         _state.value = UnifiedPushState.Disabled
-        workManager.enqueueCloudPushSync(registration.generation)
+        workManager.enqueueCloudPushSync(registration.generation, snapshotId = null)
     }
 
     /**
@@ -190,13 +210,20 @@ class UnifiedPushManager @VisibleForTesting constructor(
             Timber.i("Ignoring an endpoint of a registration that is no longer wanted")
             return
         }
-        if (!registrationRepository.setEndpoint(registration.generation, endpoint.url)) {
+        val snapshot = registrationRepository.acceptEndpoint(
+            generation = registration.generation,
+            url = endpoint.url,
+            keys = endpoint.webPushKeys(),
+        )
+        if (snapshot == null) {
             Timber.i("Ignoring an endpoint that was replaced while it was stored")
             return
         }
-        Timber.i("Received a push endpoint, temporary=${endpoint.temporary}")
+        Timber.i(
+            "Received a push endpoint, temporary=${endpoint.temporary}, keys=${snapshot.keysPresent}",
+        )
         _state.value = UnifiedPushState.Registered(temporary = endpoint.temporary)
-        workManager.enqueueCloudPushSync(registration.generation)
+        workManager.enqueueCloudPushSync(registration.generation, snapshot.snapshotId)
     }
 
     /**
@@ -214,7 +241,7 @@ class UnifiedPushManager @VisibleForTesting constructor(
         if (firebaseAvailable) {
             val firebase = registrationRepository.startFirebase()
             _state.value = UnifiedPushState.Disabled
-            workManager.enqueueCloudPushSync(firebase.generation)
+            workManager.enqueueCloudPushSync(firebase.generation, snapshotId = null)
         } else {
             // This build has no Firebase to fall back to, so the registration has to be renewed
             // with the distributor instead: without an endpoint nothing would deliver at all. The
@@ -262,7 +289,7 @@ class UnifiedPushManager @VisibleForTesting constructor(
                 distributor == null || distributor !in connector.availableDistributors() -> {
                     UnifiedPushState.NoDistributor
                 }
-                desired.endpointUrl == null || connector.acknowledgedDistributor() == null -> {
+                desired.endpoint == null || connector.acknowledgedDistributor() == null -> {
                     UnifiedPushState.Registering
                 }
                 // Whether the current endpoint is a temporary fallback is only known from the callback.
@@ -275,5 +302,39 @@ class UnifiedPushManager @VisibleForTesting constructor(
         val server = if (serverManager.isRegistered()) serverManager.servers().firstOrNull() else null
         // The cloud push transport is stored per device, so every server reports the same one.
         return server?.let { serverManager.integrationRepository(it.id).getRegistration().cloudPush }
+    }
+}
+
+/**
+ * Whether the servers already have exactly [endpoint] with [keys].
+ *
+ * Asking only whether some endpoint is registered is not enough, because three different states all
+ * report one: a registration that is still the previous endpoint, one whose keys were rotated while
+ * the URL stayed the same, and one whose key association was lost. All three need the sync to run,
+ * so the whole tuple has to be compared.
+ *
+ * The comparison is on the values and never on their text form, so no key material is formatted
+ * anywhere. The opaque push token is deliberately not part of it: a renewal keeps the token of the
+ * registration it renews, which is decided when the registration is built, not here.
+ */
+private fun CloudPushTransport?.isUpToDateFor(endpoint: EndpointSnapshot, keys: WebPushKeys?): Boolean {
+    val registered = this as? CloudPushTransport.Endpoint ?: return false
+    return registered.url == endpoint.url && registered.webPushKeys == keys
+}
+
+/**
+ * The recipient keys this endpoint was handed out with, `null` when it came without usable ones.
+ *
+ * A distributor that does not expect an encrypted notification supplies no key set at all. One that
+ * supplies an incomplete set is treated the same way rather than rejected, because an endpoint
+ * without keys still delivers while a half key pair would only produce a registration no sender can
+ * use.
+ */
+private fun PushEndpoint.webPushKeys(): WebPushKeys? = pubKeySet?.let { keys ->
+    if (keys.pubKey.isBlank() || keys.auth.isBlank()) {
+        Timber.w("The distributor supplied an incomplete key set, treating the endpoint as keyless")
+        null
+    } else {
+        WebPushKeys(p256dh = keys.pubKey, auth = keys.auth)
     }
 }

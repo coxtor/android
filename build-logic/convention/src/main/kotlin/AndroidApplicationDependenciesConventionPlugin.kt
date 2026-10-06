@@ -101,11 +101,21 @@ class AndroidApplicationDependenciesConventionPlugin : Plugin<Project> {
                     // `:automotive` reuses `:app/src/main` sources, so both application modules
                     // need the connector even though the feature is only offered on `:app`.
                     "implementation"(libs.unifiedpush.connector) {
-                        // The connector depends on Tink, which brings the full protobuf runtime
-                        // while the app already uses protobuf-javalite. Keeping both duplicates
-                        // every com.google.protobuf class and fails the build.
-                        exclude(group = "com.google.protobuf", module = "protobuf-java")
+                        // The connector asks for the JVM build of Tink, which brings the full
+                        // protobuf runtime while the app already uses protobuf-javalite. Keeping
+                        // both duplicates every com.google.protobuf class and fails the build. The
+                        // Android build below provides the same `com.google.crypto.tink.subtle`
+                        // classes the connector uses and shades its own protobuf, so exactly one
+                        // Tink runtime serves the connector and the encrypted preferences.
+                        exclude(group = "com.google.crypto.tink", module = "tink")
                     }
+
+                    // Protected storage for the keys of a push subscription, see
+                    // `WebPushKeyStorageImpl`.
+                    "implementation"(libs.security.crypto)
+                    // Pinned above the version security-crypto asks for, so that the one Tink on
+                    // the runtime classpath is also new enough for the connector.
+                    "implementation"(libs.tink.android)
 
                     "androidTestImplementation"(libs.bundles.androidx.test)
                     "androidTestImplementation"(libs.leakcanary.android.instrumentation)

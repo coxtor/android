@@ -22,8 +22,11 @@ sealed interface CloudPushTransport {
      * @property url Absolute URL Home Assistant posts the notification to. Home Assistant validates
      * it as a URL and rejects the registration otherwise, see
      * [SCHEMA_APP_DATA](https://github.com/home-assistant/core/blob/14f9b7e699d6de2b33901a3decb6a0ca9c8c21df/homeassistant/components/mobile_app/const.py#L105-L117).
+     * @property webPushKeys Recipient keys of this subscription, forwarded so that a sender can
+     * address it. `null` when the transport that owns the endpoint supplied none, which is what a
+     * subscription that expects an unencrypted notification does.
      */
-    data class Endpoint(val url: String) : CloudPushTransport {
+    data class Endpoint(val url: String, val webPushKeys: WebPushKeys? = null) : CloudPushTransport {
         init {
             require(url.isNotBlank()) { "A push endpoint URL cannot be blank" }
         }
